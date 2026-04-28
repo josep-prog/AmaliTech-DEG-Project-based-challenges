@@ -1,25 +1,33 @@
 import hashlib
 import json
+import logging
+import os
 import threading
 import time
+from decimal import Decimal
 from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 app = FastAPI(title="Idempotency Gateway")
 
+# TODO: redis, this dies on restart
 cache = {}
 in_flight = {}
 lock = threading.Lock()
 
-TTL = 86400
-CURRENCIES = {"RWF", "GHS"}
+TTL = int(os.getenv("IDEMPOTENCY_TTL", 86400))
+CURRENCIES = set(os.getenv("SUPPORTED_CURRENCIES", "RWF,GHS").split(","))
 
 
 class PaymentRequest(BaseModel):
-    amount: float = Field(gt=0)
+    amount: Decimal = Field(gt=0)
     currency: str = Field(min_length=3, max_length=3)
 
     @field_validator("currency")
@@ -32,16 +40,43 @@ class PaymentRequest(BaseModel):
 
 
 def hash_payment(payment):
-    data = json.dumps({"amount": payment.amount, "currency": payment.currency}, sort_keys=True)
+    # str() so 10.5 and 10.50 dont hash differently
+    data = json.dumps({"amount": str(payment.amount), "currency": payment.currency}, sort_keys=True)
     return hashlib.sha256(data.encode()).hexdigest()
 
 
+def check_rate_limit(key: str) -> None:
+    # TODO: add per-key rate limiting
+    pass
+
+
 def purge_expired():
-    cutoff = time.time() - TTL
-    expired = [k for k, v in cache.items() if v["created_at"] < cutoff]
+    now = time.time()
+    expired = [k for k in cache if now - cache[k]["created_at"] >= TTL]
+    if expired:
+        logger.info("Purging %d expired keys", len(expired))
     for k in expired:
-        cache.pop(k, None)
+        del cache[k]
         in_flight.pop(k, None)
+
+
+def _background_cleanup():
+    while True:
+        time.sleep(300)
+        with lock:
+            try:
+                purge_expired()
+            except Exception:
+                logger.exception("cleanup failed")
+
+
+cleanup_thread = threading.Thread(target=_background_cleanup, daemon=True)
+cleanup_thread.start()
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "cache_size": len(cache)}
 
 
 @app.post("/process-payment")
@@ -52,19 +87,24 @@ def process_payment(
     if not idempotency_key:
         raise HTTPException(status_code=400, detail="Idempotency-Key header is required.")
 
+    check_rate_limit(idempotency_key)
+
     req_hash = hash_payment(payment)
-    pending = None
+    pending_event = None
 
     with lock:
-        purge_expired()
         existing = cache.get(idempotency_key)
 
-        if existing:
+        if existing is not None:
             if existing["status"] == "processing":
-                pending = in_flight[idempotency_key]
+                # tried sleep(0.1) polling first but Event is cleaner
+                # FIXME: hangs full 30s if original caller dies, no heartbeat
+                pending_event = in_flight[idempotency_key]
             elif existing["body_hash"] != req_hash:
+                logger.warning("key %r reused with different body", idempotency_key)
                 raise HTTPException(status_code=422, detail="This key was already used with a different request body.")
             else:
+                logger.debug(f"cache hit: {idempotency_key!r}")
                 return JSONResponse(
                     content=existing["response"],
                     status_code=existing["status_code"],
@@ -81,8 +121,9 @@ def process_payment(
                 "created_at": time.time(),
             }
 
-    if pending:
-        pending.wait(timeout=30)
+    if pending_event is not None:
+        logger.info("waiting on in-flight: %r", idempotency_key)
+        pending_event.wait(timeout=30)
         with lock:
             existing = cache.get(idempotency_key)
         if existing and existing["status"] == "done":
@@ -91,9 +132,11 @@ def process_payment(
                 status_code=existing["status_code"],
                 headers={"X-Cache-Hit": "true"},
             )
+        # timed out - orphaned entry stays in cache until TTL, not ideal
         raise HTTPException(status_code=503, detail="Timed out waiting for in-flight request.")
 
     try:
+        logger.info(f"processing {payment.amount} {payment.currency}")
         time.sleep(2)
 
         response = {"status": "success", "message": f"Charged {payment.amount} {payment.currency}"}
